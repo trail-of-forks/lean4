@@ -7,6 +7,7 @@ module
 
 prelude
 public import Lean.Compiler.LCNF.CompilerM
+public import Lean.Compiler.LCNF.ScalarCCheck
 import Lean.Compiler.LCNF.EmitUtil
 import Lean.Compiler.NameMangling
 import Lean.Compiler.LCNF.PhaseExt
@@ -922,7 +923,7 @@ partial def emitCode (code : Code .impure) : EmitM Unit := do
 
 end
 
-def emitDecl (decl : Decl .impure) : EmitM Unit := do
+def emitDeclOriginal (decl : Decl .impure) : EmitM Unit := do
   let env ← getEnv
   if hasInitAttr env decl.name || isSimpleGroundDecl env decl.name then
     return ()
@@ -965,13 +966,23 @@ def emitDecl (decl : Decl .impure) : EmitM Unit := do
       withReader (fun ctx => { ctx with currFn := decl.name, currParams := ps }) do
         emitCode code
 
-def emitFns : EmitM Unit := do
+/-- Keep the scalar identity path total so its exact text can be compared in the kernel. -/
+def emitDecl (decl : Decl .impure) : EmitM Unit := do
+  let env ← getEnv
+  if hasInitAttr env decl.name || isSimpleGroundDecl env decl.name then
+    return ()
+  match ScalarC.check decl with
+  | .ok input => emit (ScalarC.legacyText (← toCName decl.name)
+      (input.param.binderName.mangle (pre := "v_")))
+  | .error _ => emitDeclOriginal decl
+
+def emitFns (emitFunction : Decl .impure → EmitM Unit := emitDecl) : EmitM Unit := do
   (← getLocalDecls).forM go
 where
   go (decl : Decl .impure) : EmitM Unit := do
     let decl ← decl.internalize (uniqueIdents := true)
     try
-      emitDecl decl
+      emitFunction decl
     catch err =>
       throwError m!"{err.toMessageData}\ncompiling:\n{decl.name}"
 
@@ -1158,10 +1169,10 @@ def emitFileFooter : EmitM Unit :=
    "#endif"
   ]
 
-def main : EmitM Unit := do
+def main (emitFunction : Decl .impure → EmitM Unit := emitDecl) : EmitM Unit := do
   emitFileHeader
   emitFnDecls
-  emitFns
+  emitFns emitFunction
   if (← getEnv).header.isModule then
     emitInitFn (phases := .runtime)
     emitInitFn (phases := .comptime)
@@ -1171,19 +1182,55 @@ def main : EmitM Unit := do
   emitMainFnIfNeeded
   emitFileFooter
 
-public def emitCForDecls (modName : Name) (decls : Array Name) : CoreM String := do
+def emitCForDeclsWith (emitFunction : Decl .impure → EmitM Unit) (modName : Name) (decls : Array Name) : CoreM String := do
   let (localDecls, otherModuleDecls) ← collectUsedDecls decls
   let env ← getEnv
   let indexMap := getImpureDeclIndices env decls
   let localDecls := localDecls.qsort fun l r => indexMap[l.name]! < indexMap[r.name]!
   let (_, { buf, .. }) ←
-    main
+    main emitFunction
       |>.run { localDecls, otherModuleDecls, modName }
       |>.run {}
       |>.run (phase := .impure)
   return buf
 
+public def emitCForDecls (modName : Name) (decls : Array Name) : CoreM String :=
+  emitCForDeclsWith emitDecl modName decls
+
+/-- Reference path retaining the original, unfactored function emitter. -/
+public def emitCForDeclsOriginal (modName : Name) (decls : Array Name) : CoreM String :=
+  emitCForDeclsWith emitDeclOriginal modName decls
+
 public def emitC (modName : Name) : CoreM String := do
   emitCForDecls modName (← getLocalImpureDecls)
+
+namespace ScalarC
+
+def emitFunctionAST (decl : Decl .impure) : EmitM Unit := do
+  let env ← getEnv
+  if hasInitAttr env decl.name || isSimpleGroundDecl env decl.name then
+    throwError "scalar C: initialization declarations are unsupported"
+  let .ok input := check decl | throwError "unsupported scalar C declaration: {decl.name}"
+  let function := input.lower (← toCName decl.name)
+  emit (render function)
+
+/-- Strict experimental backend. Module scaffolding is shared; selected functions use ASTs. -/
+public def emitCForDecls (modName : Name) (decls : Array Name) : CoreM String :=
+  emitCForDeclsWith emitFunctionAST modName decls
+
+/-- Extract the supported AST after the same identifier internalization used by C emission. -/
+public def lowerDecl (modName declName : Name) : CoreM Function := do
+  let (localDecls, otherModuleDecls) ← collectUsedDecls #[declName]
+  let some decl := localDecls.find? (·.name == declName)
+    | throwError "scalar C: declaration not found: {declName}"
+  let action : EmitM Function := do
+    let decl ← decl.internalize (uniqueIdents := true)
+    let .ok input := check decl | throwError "unsupported scalar C declaration: {decl.name}"
+    return input.lower (← toCName decl.name)
+  let (function, _) ← action.run { localDecls, otherModuleDecls, modName }
+    |>.run {} |>.run (phase := .impure)
+  return function
+
+end ScalarC
 
 end Lean.Compiler.LCNF

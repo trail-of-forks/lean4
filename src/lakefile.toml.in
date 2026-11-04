@@ -77,6 +77,8 @@ globs = [
   "Lean.Compiler.IR.EmitLLVM",
   # New compiler orphan file used in tests
   "Lean.Compiler.LCNF.Probing",
+  # Experimental structured C backend used in tests
+  "Lean.Compiler.LCNF.ScalarC",
 ]
 
 [[lean_lib]]
