@@ -15,9 +15,22 @@ import Lean.Meta.Match.MatcherInfo
 import Lean.Compiler.LCNF.SplitSCC
 public import Lean.Compiler.IR.Basic
 public import Lean.Compiler.LCNF.CompilerM
+public import Lean.Compiler.LCNF.PassManager
 
 public section
 namespace Lean.Compiler.LCNF
+
+/-- Select the conservative proof-facing profile for automatic compilation. -/
+register_builtin_option compiler.simplified : Bool := {
+  defValue := false
+  descr := "use the conservative LCNF profile: disable closed extraction and reset/reuse, and omit RC coalescing"
+}
+
+/-- Enforce the profile even if a caller requested either optimization. Keep the
+profile flag in base options so dependency resumption uses the same pipeline. -/
+def simplifiedOptions (opts : Options) : Options :=
+  compiler.reuse.set (compiler.extract_closed.set (compiler.simplified.set opts true) false) false
+
 /--
 We do not generate code for `declName` if
 - Its type is a proposition.
@@ -119,7 +132,13 @@ def resumeCompilation (declName : Name) (baseOpts : Options) : CoreM Unit := do
 
 namespace PassManager
 
-partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit := withAtLeastMaxRecDepth 8192 do
+/-- Preserve all registered passes except RC coalescing. In particular boxing,
+explicit RC, phase saves and user-installed passes with other names remain. -/
+def simplified (manager : PassManager) : PassManager :=
+  { manager with impurePasses := manager.impurePasses.filter (fun pass => pass.name != `coalesceRc) }
+
+partial def runWithProfile (declNames : Array Name) (baseOpts : Options)
+    (simplifiedProfile : Bool) : CompilerM Unit := withAtLeastMaxRecDepth 8192 do
   /-
   Note: we need to increase the recursion depth because we currently do to save phase1
   declarations in .olean files. Then, we have to recursively compile all dependencies,
@@ -190,6 +209,7 @@ partial def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :
 
   let decls := markRecDecls decls
   let manager ← getPassManager
+  let manager := if simplifiedProfile then manager.simplified else manager
   let isCheckEnabled := compiler.check.get (← getOptions)
   let decls ← runPassManagerPart .pure .pure "compilation (LCNF base)" manager.basePasses decls isCheckEnabled
   let decls ← runPassManagerPart .pure .pure "compilation (LCNF mono)" manager.monoPasses decls isCheckEnabled
@@ -227,14 +247,39 @@ where
       let decls := state.fst.withAssertPurity outPhase fun h => h ▸ state.snd
       return decls
 
+/-- Reference driver, retaining the original public signature and pass list. -/
+def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :=
+  runWithProfile declNames baseOpts false
+
+/-- Compatibility entry for users inspecting the original per-phase runner. -/
+def run.runPassManagerPart (inPhase outPhase : Purity) (profilerName : String)
+    (passes : Array Pass) (decls : Array (Decl inPhase)) (isCheckEnabled : Bool) :
+    CompilerM (Array (Decl outPhase)) :=
+  runWithProfile.runPassManagerPart inPhase outPhase profilerName passes decls isCheckEnabled
+
 end PassManager
 
 def main (declNames : Array Name) (baseOpts : Options) : CoreM Unit := do
   withTraceNode `Compiler (fun _ => return m!"compiling: {declNames}") do
     CompilerM.run <| PassManager.run declNames baseOpts
 
+/-- Conservative profile of the same driver. Preparation, postponement,
+metadata, checks, boxing, IR registration and emission infrastructure remain.
+The reference `main` entry stays available for existing callers and proofs. -/
+def mainSimplified (declNames : Array Name) (baseOpts : Options) : CoreM Unit :=
+  withOptions simplifiedOptions do
+    withTraceNode `Compiler (fun _ => return m!"compiling (simplified): {declNames}") do
+      CompilerM.run <| PassManager.runWithProfile declNames (simplifiedOptions baseOpts) true
+
+/-- Automatic compilation selects a profile; the default remains reference. -/
+def compileWithProfile (declNames : Array Name) (baseOpts : Options) : CoreM Unit := do
+  if compiler.simplified.get (← getOptions) then
+    mainSimplified declNames baseOpts
+  else
+    main declNames baseOpts
+
 builtin_initialize
-  compileDeclsRef.set main
+  compileDeclsRef.set compileWithProfile
 
 builtin_initialize
   registerTraceClass `Compiler.init (inherited := true)
