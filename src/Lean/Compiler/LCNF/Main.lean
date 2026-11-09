@@ -26,10 +26,20 @@ register_builtin_option compiler.simplified : Bool := {
   descr := "use the conservative LCNF profile: disable closed extraction and reset/reuse, and omit RC coalescing"
 }
 
+/-- Restore diagnostic wrappers while using the conservative pass selection. -/
+register_builtin_option compiler.simplified.diagnostics : Bool := {
+  defValue := false
+  descr := "use the diagnostic runner with the conservative compiler profile"
+}
+
 /-- Enforce the profile even if a caller requested either optimization. Keep the
 profile flag in base options so dependency resumption uses the same pipeline. -/
 def simplifiedOptions (opts : Options) : Options :=
   compiler.reuse.set (compiler.extract_closed.set (compiler.simplified.set opts true) false) false
+
+/-- Fix the runner policy as well as the pass profile for resumed dependencies. -/
+def simplifiedRunnerOptions (diagnostics : Bool) (opts : Options) : Options :=
+  compiler.simplified.diagnostics.set (simplifiedOptions opts) diagnostics
 
 /--
 We do not generate code for `declName` if
@@ -137,8 +147,81 @@ explicit RC, phase saves and user-installed passes with other names remain. -/
 def simplified (manager : PassManager) : PassManager :=
   { manager with impurePasses := manager.impurePasses.filter (fun pass => pass.name != `coalesceRc) }
 
-partial def runWithProfile (declNames : Array Name) (baseOpts : Options)
-    (simplifiedProfile : Bool) : CompilerM Unit := withAtLeastMaxRecDepth 8192 do
+def runPassManagerPartDiagnostic (inPhase outPhase : Purity) (profilerName : String)
+    (passes : Array Pass) (decls : Array (Decl inPhase)) (isCheckEnabled : Bool) :
+    CompilerM (Array (Decl outPhase)) := do
+  profileitM Exception profilerName (← getOptions) do
+    let mut state : (pu : Purity) × Array (Decl pu) := ⟨inPhase, decls⟩
+    for pass in passes do
+      checkSystem "LCNF compiler"
+      state ← withTraceNode `Compiler (fun _ => return m!"compiler phase: {pass.phase}, pass: {pass.name}") do
+        let decls ← withPhase pass.phase do
+          state.fst.withAssertPurity pass.phase.toPurity fun h => do
+            pass.run (h ▸ state.snd)
+        pure ⟨_, decls⟩
+      withPhase pass.phaseOut <| checkpoint pass.name state.snd (isCheckEnabled || pass.shouldAlwaysRunCheck)
+    let decls := state.fst.withAssertPurity outPhase fun h => h ▸ state.snd
+    return decls
+
+/-- Finite phase runner without optional trace/profiler/pretty-printing wrappers.
+Resource checks, phase scopes, dynamic purity assertions and all requested or
+mandatory declaration checks are retained. Individual passes are unchanged. -/
+def runPassManagerPartPlain (inPhase outPhase : Purity)
+    (passes : Array Pass) (decls : Array (Decl inPhase)) (isCheckEnabled : Bool) :
+    CompilerM (Array (Decl outPhase)) := do
+  let mut state : (pu : Purity) × Array (Decl pu) := ⟨inPhase, decls⟩
+  for pass in passes do
+    checkSystem "LCNF compiler"
+    let decls ← withPhase pass.phase do
+      state.fst.withAssertPurity pass.phase.toPurity fun h => do
+        pass.run (h ▸ state.snd)
+    state := ⟨_, decls⟩
+    withPhase pass.phaseOut do
+      if isCheckEnabled || pass.shouldAlwaysRunCheck then
+        for decl in state.snd do
+          decl.check
+  return state.fst.withAssertPurity outPhase fun h => h ▸ state.snd
+
+/-- Strategies for the driver's optional diagnostic boundaries. They share the
+same preparation, passes, state saves, checks and IR implementation. -/
+structure DriverRunner where
+  runPart : (inPhase outPhase : Purity) → String → Array Pass →
+    Array (Decl inPhase) → Bool → CompilerM (Array (Decl outPhase))
+  split : Array (Decl .pure) → CompilerM (Array (Array (Decl .pure)))
+  finish : Array (Decl .impure) → CompilerM Unit
+  implementedBy : Name → Name → CompilerM Unit
+  postponed : Array Name → CompilerM Unit
+
+/-- The diagnostic strategy retains the reference driver's wrappers. -/
+def diagnosticRunner : DriverRunner where
+  runPart := runPassManagerPartDiagnostic
+  split decls := withTraceNode `Compiler.splitSCC (fun _ => return m!"Splitting up SCC") do
+    splitScc decls
+  finish decls := do
+    if (← Lean.isTracingEnabledFor `Compiler.result) then
+      for decl in decls do
+        let decl ← normalizeFVarIds decl
+        Lean.addTrace `Compiler.result m!"size: {decl.size}\n{← ppDecl' decl (← getPhase)}"
+    profileitM Exception "compilation (IR)" (← getOptions) do
+      let irDecls ← IR.toIR decls
+      discard <| IR.compile irDecls
+  implementedBy fnName declName := do
+    trace[Compiler.inferVisibility] m!"Marking {fnName} as opaque because it implements {declName}"
+  postponed names := do trace[Compiler] "postponing compilation of {names}"
+
+/-- No optional diagnostic callbacks in the driver strategy. Existing workers
+can still have their own diagnostics; their implementations are not rewritten. -/
+def plainRunner : DriverRunner where
+  runPart := fun inPhase outPhase _ => runPassManagerPartPlain inPhase outPhase
+  split := splitScc
+  finish decls := do
+    let irDecls ← IR.toIR decls
+    discard <| IR.compile irDecls
+  implementedBy := fun _ _ => pure ()
+  postponed := fun _ => pure ()
+
+partial def runWithRunner (declNames : Array Name) (baseOpts : Options)
+    (simplifiedProfile : Bool) (runner : DriverRunner) : CompilerM Unit := withAtLeastMaxRecDepth 8192 do
   /-
   Note: we need to increase the recursion depth because we currently do to save phase1
   declarations in .olean files. Then, we have to recursively compile all dependencies,
@@ -166,7 +249,7 @@ partial def runWithProfile (declNames : Array Name) (baseOpts : Options)
         resumeCompilation fnName baseOpts
         if !isDeclPublic (← getEnv) fnName then
           if let some decl ← getLocalDeclAt? fnName .base then
-            trace[Compiler.inferVisibility] m!"Marking {fnName} as opaque because it implements {declName}"
+            runner.implementedBy fnName declName
             LCNF.markDeclPublicRec .base decl
             if let some decl ← getLocalDeclAt? fnName .mono then
               LCNF.markDeclPublicRec .mono decl
@@ -194,7 +277,7 @@ partial def runWithProfile (declNames : Array Name) (baseOpts : Options)
       -- avoid re-compiling the meta defs in this process; the entry for `leanir` is not affected
       modifyEnv (postponedCompileDeclsExt.modifyState · fun s => decls.foldl (·.erase ·.name) s)
     else
-      trace[Compiler] "postponing compilation of {decls.map (·.name)}"
+      runner.postponed (decls.map (·.name))
       return
 
   -- Compile any postponed dependencies first.
@@ -211,41 +294,26 @@ partial def runWithProfile (declNames : Array Name) (baseOpts : Options)
   let manager ← getPassManager
   let manager := if simplifiedProfile then manager.simplified else manager
   let isCheckEnabled := compiler.check.get (← getOptions)
-  let decls ← runPassManagerPart .pure .pure "compilation (LCNF base)" manager.basePasses decls isCheckEnabled
-  let decls ← runPassManagerPart .pure .pure "compilation (LCNF mono)" manager.monoPasses decls isCheckEnabled
-  let sccs ← withTraceNode `Compiler.splitSCC (fun _ => return m!"Splitting up SCC") do
-    splitScc decls
+  let decls ← runner.runPart .pure .pure "compilation (LCNF base)" manager.basePasses decls isCheckEnabled
+  let decls ← runner.runPart .pure .pure "compilation (LCNF mono)" manager.monoPasses decls isCheckEnabled
+  let sccs ← runner.split decls
   for decls in sccs do
-    let decls ← runPassManagerPart .pure .impure "compilation (LCNF mono)" manager.monoPassesNoLambda decls isCheckEnabled
+    let decls ← runner.runPart .pure .impure "compilation (LCNF mono)" manager.monoPassesNoLambda decls isCheckEnabled
     withPhase .impure do
-      let decls ← runPassManagerPart .impure .impure "compilation (LCNF impure)" manager.impurePasses decls isCheckEnabled
+      let decls ← runner.runPart .impure .impure "compilation (LCNF impure)" manager.impurePasses decls isCheckEnabled
 
-      if (← Lean.isTracingEnabledFor `Compiler.result) then
-        for decl in decls do
-          let decl ← normalizeFVarIds decl
-          Lean.addTrace `Compiler.result m!"size: {decl.size}\n{← ppDecl' decl (← getPhase)}"
+      runner.finish decls
 
-      -- TODO consider doing this in one go afterwards in a separate mapM and running clearPure to save memory
-      -- or consider running clear? unclear
-      profileitM Exception "compilation (IR)" (← getOptions) do
-        let irDecls ← IR.toIR decls
-        discard <| IR.compile irDecls
-where
-  runPassManagerPart (inPhase outPhase : Purity) (profilerName : String)
-      (passes : Array Pass) (decls : Array (Decl inPhase)) (isCheckEnabled : Bool) :
-      CompilerM (Array (Decl outPhase)) := do
-    profileitM Exception profilerName (← getOptions) do
-      let mut state : (pu : Purity) × Array (Decl pu) := ⟨inPhase, decls⟩
-      for pass in passes do
-        checkSystem "LCNF compiler"
-        state ← withTraceNode `Compiler (fun _ => return m!"compiler phase: {pass.phase}, pass: {pass.name}") do
-          let decls ← withPhase pass.phase do
-            state.fst.withAssertPurity pass.phase.toPurity fun h => do
-              pass.run (h ▸ state.snd)
-          pure ⟨_, decls⟩
-        withPhase pass.phaseOut <| checkpoint pass.name state.snd (isCheckEnabled || pass.shouldAlwaysRunCheck)
-      let decls := state.fst.withAssertPurity outPhase fun h => h ▸ state.snd
-      return decls
+/-- Reference-compatible diagnostic driver with optional conservative pass selection. -/
+def runWithProfile (declNames : Array Name) (baseOpts : Options)
+    (simplifiedProfile : Bool) : CompilerM Unit :=
+  runWithRunner declNames baseOpts simplifiedProfile diagnosticRunner
+
+/-- Compatibility entry for the former nested diagnostic phase runner. -/
+def runWithProfile.runPassManagerPart (inPhase outPhase : Purity) (profilerName : String)
+    (passes : Array Pass) (decls : Array (Decl inPhase)) (isCheckEnabled : Bool) :
+    CompilerM (Array (Decl outPhase)) :=
+  runPassManagerPartDiagnostic inPhase outPhase profilerName passes decls isCheckEnabled
 
 /-- Reference driver, retaining the original public signature and pass list. -/
 def run (declNames : Array Name) (baseOpts : Options) : CompilerM Unit :=
@@ -263,18 +331,27 @@ def main (declNames : Array Name) (baseOpts : Options) : CoreM Unit := do
   withTraceNode `Compiler (fun _ => return m!"compiling: {declNames}") do
     CompilerM.run <| PassManager.run declNames baseOpts
 
-/-- Conservative profile of the same driver. Preparation, postponement,
-metadata, checks, boxing, IR registration and emission infrastructure remain.
-The reference `main` entry stays available for existing callers and proofs. -/
+/-- Conservative profile using the plain runner, even when diagnostic flags
+are enabled by the caller. The policy is carried through dependency resumption. -/
 def mainSimplified (declNames : Array Name) (baseOpts : Options) : CoreM Unit :=
-  withOptions simplifiedOptions do
+  withOptions (simplifiedRunnerOptions false) do
+    CompilerM.run <| PassManager.runWithRunner declNames
+      (simplifiedRunnerOptions false baseOpts) true PassManager.plainRunner
+
+/-- The same conservative pass selection with the diagnostic runner available
+for development. No pass algorithm or checking policy changes between modes. -/
+def mainSimplifiedDiagnostic (declNames : Array Name) (baseOpts : Options) : CoreM Unit :=
+  withOptions (simplifiedRunnerOptions true) do
     withTraceNode `Compiler (fun _ => return m!"compiling (simplified): {declNames}") do
-      CompilerM.run <| PassManager.runWithProfile declNames (simplifiedOptions baseOpts) true
+      CompilerM.run <| PassManager.runWithProfile declNames (simplifiedRunnerOptions true baseOpts) true
 
 /-- Automatic compilation selects a profile; the default remains reference. -/
 def compileWithProfile (declNames : Array Name) (baseOpts : Options) : CoreM Unit := do
   if compiler.simplified.get (← getOptions) then
-    mainSimplified declNames baseOpts
+    if compiler.simplified.diagnostics.get (← getOptions) then
+      mainSimplifiedDiagnostic declNames baseOpts
+    else
+      mainSimplified declNames baseOpts
   else
     main declNames baseOpts
 
